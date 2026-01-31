@@ -1,85 +1,115 @@
 #!/usr/bin/env python3
-"""
-MX-only ISO 20022 parser (standard library only) -> sanctions screening CSV
-
-Reads input CSV containing message_id + payload_xml (header name tolerant)
-Writes output CSV with one row per message using schema:
-
-message_id, direction, format, msg_type,
-debtor_name, creditor_name,
-dbtr_agt_bic, cdtr_agt_bic, intrmy_agt_bic_1,
-remittance_70, sender_to_receiver_72, remittance_ustrd,
-raw_payload_hash, parse_status, parse_errors
-
-Usage (Windows PowerShell / CMD):
-python mx_parser_free.py --in-csv .\\test\\parser_text.csv --out .\\test\\mx_parsed.csv --your-bics ABCDUS33,ABCDUS33XXX
-
-Usage (Mac/Linux):
-python3 mx_parser_free.py --in-csv ./test/parser_text.csv --out ./test/mx_parsed.csv --your-bics ABCDUS33,ABCDUS33XXX
-"""
-
-import argparse
-import csv
-import hashlib
-import re
+import argparse, csv, hashlib, re, html
 from xml.etree import ElementTree as ET
-from typing import Dict, List, Tuple, Optional
 
-# Allow very large XML fields inside CSV
 csv.field_size_limit(50_000_000)
 
 CSV_COLUMNS = [
-    "message_id", "direction", "format", "msg_type",
-    "debtor_name", "creditor_name",
-    "dbtr_agt_bic", "cdtr_agt_bic", "intrmy_agt_bic_1",
-    "remittance_70", "sender_to_receiver_72", "remittance_ustrd",
-    "raw_payload_hash", "parse_status", "parse_errors",
+    "message_id","direction","format","msg_type",
+    "debtor_name","creditor_name",
+    "dbtr_agt_bic","cdtr_agt_bic","intrmy_agt_bic_1",
+    "remittance_70","sender_to_receiver_72","remittance_ustrd",
+    "raw_payload_hash","parse_status","parse_errors"
 ]
 
 def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+    return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
 def normalize_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
-def safe_join(parts: List[str], sep: str = " | ") -> str:
+def safe_join(parts, sep=" | "):
     clean = [normalize_space(x) for x in parts if x and normalize_space(x)]
     return sep.join(clean)
 
-def is_mx(payload: str) -> bool:
+def canonical_header(h: str) -> str:
+    return (h or "").replace("\ufeff","").strip().lower().replace(" ", "_")
+
+def resolve_columns(fieldnames):
+    if not fieldnames:
+        raise ValueError("Input CSV has no headers.")
+    canon_to_real = {canonical_header(h): h for h in fieldnames}
+    id_candidates = ["message_id","msg_id","id","messageid"]
+    payload_candidates = ["payload_xml","payload","xml","raw_payload","payloadxml"]
+    real_id = next((canon_to_real.get(c) for c in id_candidates if c in canon_to_real), None)
+    real_payload = next((canon_to_real.get(c) for c in payload_candidates if c in canon_to_real), None)
+    if not real_id or not real_payload:
+        raise ValueError(f"Missing required columns. Found headers: {fieldnames}")
+    return real_id, real_payload
+
+def strip_ns(tag: str) -> str:
+    if tag.startswith("{"):
+        return tag.split("}", 1)[1]
+    if ":" in tag:
+        return tag.split(":", 1)[1]
+    return tag
+
+def looks_like_mx(payload: str) -> bool:
     p = (payload or "").lstrip()
     if not p.startswith("<"):
         return False
-    # Typical ISO 20022 tells
-    return ("urn:iso:std:iso:20022" in p) or ("<Document" in p) or ("<Doc:" in p)
+    head = p[:500]
+    return ("AppHdr" in head) or ("Document" in head) or ("urn:iso:std:iso:20022" in p)
 
-def get_namespace_uri(root: ET.Element) -> str:
-    if root.tag.startswith("{"):
-        return root.tag.split("}")[0].strip("{")
-    return ""
+def normalize_payload_xml(payload: str):
+    notes = []
+    p = (payload or "").lstrip()
+    if "&lt;" in p and "&gt;" in p:
+        un = html.unescape(p)
+        if un.lstrip().startswith("<"):
+            notes.append("html_unescape")
+            p = un.lstrip()
+    return p, notes
 
-def detect_msg_type_from_ns(ns_uri: str) -> str:
-    # Usually ends with pacs.008.001.08, pacs.009.001.08, etc.
-    if not ns_uri:
-        return ""
-    tail = ns_uri.split(":")[-1]
-    return tail[:50]
+def wrap_if_two_roots(xml_text: str):
+    """
+    If xml_text has two top-level elements (e.g., <AppHdr>...</AppHdr><pacs:Document>...</pacs:Document>),
+    wrap them in a synthetic root so ET can parse it.
+    """
+    t = xml_text.lstrip()
+    # Heuristic: starts with AppHdr and later contains a second '<...:Document'
+    if "AppHdr" in t[:200] and re.search(r"</[^>]*AppHdr>\s*<[^>]*Document\b", t, flags=re.DOTALL):
+        return "<Root>" + t + "</Root>", ["wrapped_root"]
+    return xml_text, []
 
-def et_find_first_text(node: ET.Element, xpaths: List[str], ns: Dict[str, str]) -> str:
-    for xp in xpaths:
-        el = node.find(xp, ns)
-        if el is not None and el.text:
-            return normalize_space(el.text)
-    return ""
+def find_first_by_localname(root: ET.Element, local: str):
+    for el in root.iter():
+        if strip_ns(el.tag) == local:
+            return el
+    return None
 
-def et_find_all_text(node: ET.Element, xp: str, ns: Dict[str, str]) -> List[str]:
+def find_all_text_by_localpath(root: ET.Element, locals_path):
     out = []
-    for el in node.findall(xp, ns):
-        if el is not None and el.text:
+    parent = {c: p for p in root.iter() for c in p}
+    for el in root.iter():
+        if strip_ns(el.tag) != locals_path[-1]:
+            continue
+        cur = el
+        ok = True
+        for i in range(len(locals_path)-2, -1, -1):
+            cur = parent.get(cur)
+            if cur is None or strip_ns(cur.tag) != locals_path[i]:
+                ok = False
+                break
+        if ok and el.text:
             out.append(normalize_space(el.text))
     return out
 
-def infer_direction_from_bics(dbtr_agt_bic: str, cdtr_agt_bic: str, your_bics: List[str]) -> str:
+def detect_msg_type(xml_text: str) -> str:
+    m = re.search(r"(pacs|camt|pain)\.\d{3}\.\d{3}\.\d{2}", xml_text)
+    return m.group(0) if m else ""
+
+def bic_from_agent(scope: ET.Element, agent_local: str) -> str:
+    agent = find_first_by_localname(scope, agent_local)
+    if agent is None:
+        return ""
+    fin = find_first_by_localname(agent, "FinInstnId")
+    if fin is None:
+        return ""
+    bic = find_first_by_localname(fin, "BICFI")
+    return normalize_space(bic.text) if (bic is not None and bic.text) else ""
+
+def infer_direction(dbtr_agt_bic, cdtr_agt_bic, your_bics):
     if not your_bics:
         return "UNKNOWN"
     your = {b.upper() for b in your_bics if b}
@@ -91,63 +121,49 @@ def infer_direction_from_bics(dbtr_agt_bic: str, cdtr_agt_bic: str, your_bics: L
         return "INCOMING"
     return "UNKNOWN"
 
-def parse_mx_et(xml_text: str) -> Tuple[Dict[str, str], List[str]]:
-    """
-    Best-effort extraction for any MX ISO 20022 message.
-    """
-    errors: List[str] = []
+def parse_mx(xml_text: str):
+    errors = []
     out = {
-        "format": "MX",
-        "msg_type": "",
-        "debtor_name": "",
-        "creditor_name": "",
-        "dbtr_agt_bic": "",
-        "cdtr_agt_bic": "",
-        "intrmy_agt_bic_1": "",
-        "remittance_70": "",
-        "sender_to_receiver_72": "",
-        "remittance_ustrd": "",
+        "format":"MX","msg_type":"",
+        "debtor_name":"","creditor_name":"",
+        "dbtr_agt_bic":"","cdtr_agt_bic":"","intrmy_agt_bic_1":"",
+        "remittance_70":"","sender_to_receiver_72":"","remittance_ustrd":""
     }
+
+    xml_text, wrap_notes = wrap_if_two_roots(xml_text)
 
     try:
         root = ET.fromstring(xml_text)
     except Exception as e:
-        return out, [f"xml_parse_error:{type(e).__name__}"]
+        return out, wrap_notes + [f"xml_parse_error:{type(e).__name__}"]
 
-    ns_uri = get_namespace_uri(root)
-    ns = {"ns": ns_uri} if ns_uri else {}
-    out["msg_type"] = detect_msg_type_from_ns(ns_uri) or root.tag[:50]
+    # Prefer the Document element even if it's <pacs:Document>
+    doc = find_first_by_localname(root, "Document")
+    base = doc if doc is not None else root
 
-    # Prefer first CdtTrfTxInf when present (most pacs messages)
-    cdt_trf = root.find(".//ns:CdtTrfTxInf", ns) if ns else root.find(".//CdtTrfTxInf")
-    base = cdt_trf if cdt_trf is not None else root
+    out["msg_type"] = detect_msg_type(xml_text) or strip_ns(base.tag)
 
-    if ns:
-        out["debtor_name"] = et_find_first_text(base, [".//ns:Dbtr/ns:Nm"], ns)
-        out["creditor_name"] = et_find_first_text(base, [".//ns:Cdtr/ns:Nm"], ns)
-        out["dbtr_agt_bic"] = et_find_first_text(base, [".//ns:DbtrAgt//ns:BICFI"], ns)
-        out["cdtr_agt_bic"] = et_find_first_text(base, [".//ns:CdtrAgt//ns:BICFI"], ns)
-        out["intrmy_agt_bic_1"] = et_find_first_text(
-            base,
-            [".//ns:IntrmyAgt1//ns:BICFI", ".//ns:IntrmyAgt//ns:BICFI"],
-            ns
-        )
-        ustrd = et_find_all_text(base, ".//ns:RmtInf/ns:Ustrd", ns)
-    else:
-        out["debtor_name"] = et_find_first_text(base, [".//Dbtr/Nm"], {})
-        out["creditor_name"] = et_find_first_text(base, [".//Cdtr/Nm"], {})
-        out["dbtr_agt_bic"] = et_find_first_text(base, [".//DbtrAgt//BICFI"], {})
-        out["cdtr_agt_bic"] = et_find_first_text(base, [".//CdtrAgt//BICFI"], {})
-        out["intrmy_agt_bic_1"] = et_find_first_text(
-            base,
-            [".//IntrmyAgt1//BICFI", ".//IntrmyAgt//BICFI"],
-            {}
-        )
-        ustrd = et_find_all_text(base, ".//RmtInf/Ustrd", {})
+    # Focus on first credit transfer transaction if present
+    tx = find_first_by_localname(base, "CdtTrfTxInf")
+    scope = tx if tx is not None else base
 
+    dbtr = find_first_by_localname(scope, "Dbtr")
+    if dbtr is not None:
+        nm = find_first_by_localname(dbtr, "Nm")
+        out["debtor_name"] = normalize_space(nm.text) if (nm is not None and nm.text) else ""
+
+    cdtr = find_first_by_localname(scope, "Cdtr")
+    if cdtr is not None:
+        nm = find_first_by_localname(cdtr, "Nm")
+        out["creditor_name"] = normalize_space(nm.text) if (nm is not None and nm.text) else ""
+
+    out["dbtr_agt_bic"] = bic_from_agent(scope, "DbtrAgt")
+    out["cdtr_agt_bic"] = bic_from_agent(scope, "CdtrAgt")
+    out["intrmy_agt_bic_1"] = bic_from_agent(scope, "IntrmyAgt1") or bic_from_agent(scope, "IntrmyAgt")
+
+    ustrd = find_all_text_by_localpath(scope, ["RmtInf","Ustrd"])
     out["remittance_ustrd"] = safe_join(ustrd)
 
-    # DQ flags (don’t fail parsing unless XML is invalid)
     if not out["debtor_name"]:
         errors.append("missing_dbtr_nm")
     if not out["creditor_name"]:
@@ -155,82 +171,54 @@ def parse_mx_et(xml_text: str) -> Tuple[Dict[str, str], List[str]]:
     if not out["remittance_ustrd"]:
         errors.append("missing_rmtinf_ustrd")
 
-    return out, errors
+    return out, wrap_notes + errors
 
-def canonical_header(h: str) -> str:
-    # strip BOM, trim, lower, replace spaces with underscore
-    return (h or "").replace("\ufeff", "").strip().lower().replace(" ", "_")
-
-def resolve_columns(fieldnames: List[str]) -> Tuple[str, str]:
-    """
-    Resolve message_id and payload_xml even if headers have spaces/BOM/casing differences.
-    Returns the actual header strings used in DictReader row dict.
-    """
-    if not fieldnames:
-        raise ValueError("Input CSV has no headers.")
-
-    canon_to_real = {canonical_header(h): h for h in fieldnames}
-
-    # Accept a few common variants
-    id_candidates = ["message_id", "msg_id", "id", "messageid"]
-    payload_candidates = ["payload_xml", "payload", "xml", "raw_payload", "payloadxml"]
-
-    real_id = next((canon_to_real.get(c) for c in id_candidates if c in canon_to_real), None)
-    real_payload = next((canon_to_real.get(c) for c in payload_candidates if c in canon_to_real), None)
-
-    if not real_id or not real_payload:
-        raise ValueError(
-            f"Input CSV must include columns like message_id and payload_xml. "
-            f"Found headers: {fieldnames}"
-        )
-    return real_id, real_payload
-
-def parse_one(message_id: str, payload_xml: str, your_bics: List[str]) -> Dict[str, str]:
-    row = {c: "" for c in CSV_COLUMNS}
+def parse_one(message_id: str, payload: str, your_bics):
+    row = {c:"" for c in CSV_COLUMNS}
     row["message_id"] = message_id
     row["format"] = "MX"
-    row["raw_payload_hash"] = sha256_text(payload_xml or "")
+    row["raw_payload_hash"] = sha256_text(payload)
     row["remittance_70"] = ""
     row["sender_to_receiver_72"] = ""
 
-    if not (payload_xml or "").strip():
+    if not (payload or "").strip():
         row["parse_status"] = "FAIL"
         row["parse_errors"] = "blank_payload"
         row["direction"] = "UNKNOWN"
         return row
 
-    if not is_mx(payload_xml):
-        # Still output a row so you can quantify non-MX in the file
+    payload_norm, notes = normalize_payload_xml(payload)
+
+    if not looks_like_mx(payload_norm):
         row["parse_status"] = "FAIL"
         row["parse_errors"] = "not_mx_payload"
         row["direction"] = "UNKNOWN"
         return row
 
-    parsed, errors = parse_mx_et(payload_xml)
-
+    parsed, errs = parse_mx(payload_norm)
     row.update(parsed)
-    row["direction"] = infer_direction_from_bics(parsed.get("dbtr_agt_bic",""), parsed.get("cdtr_agt_bic",""), your_bics)
+    row["direction"] = infer_direction(parsed.get("dbtr_agt_bic",""), parsed.get("cdtr_agt_bic",""), your_bics)
 
-    if any(e.startswith("xml_parse_error") for e in errors):
+    if any(e.startswith("xml_parse_error") for e in errs):
         row["parse_status"] = "FAIL"
     else:
-        row["parse_status"] = "OK" if not errors else "PARTIAL"
+        row["parse_status"] = "OK" if not errs else "PARTIAL"
 
-    row["parse_errors"] = ";".join(errors)
+    row["parse_errors"] = ";".join(notes + errs)
     return row
 
 def main():
-    ap = argparse.ArgumentParser(description="MX-only parser (free, standard library) to sanctions CSV schema.")
-    ap.add_argument("--in-csv", required=True, help="Input CSV path (contains message_id + payload_xml).")
-    ap.add_argument("--out", required=True, help="Output CSV path.")
-    ap.add_argument("--your-bics", default="", help="Comma-separated list of your bank BICs for direction inference.")
+    ap = argparse.ArgumentParser(description="MX-only parser (AppHdr + pacs:Document sibling safe) -> sanctions CSV.")
+    ap.add_argument("--in-csv", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--your-bics", default="")
     args = ap.parse_args()
 
     your_bics = [x.strip() for x in args.your_bics.split(",") if x.strip()]
 
     with open(args.in_csv, "r", encoding="utf-8-sig", errors="ignore", newline="") as f_in:
         r = csv.DictReader(f_in)
-        real_id_col, real_payload_col = resolve_columns(r.fieldnames)
+        id_col, payload_col = resolve_columns(r.fieldnames)
 
         with open(args.out, "w", encoding="utf-8", newline="") as f_out:
             w = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS)
@@ -238,10 +226,9 @@ def main():
 
             count = 0
             for i, in_row in enumerate(r, start=1):
-                mid = (in_row.get(real_id_col) or f"row_{i}").strip()
-                payload = in_row.get(real_payload_col) or ""
-                out_row = parse_one(mid, payload, your_bics)
-                w.writerow(out_row)
+                mid = (in_row.get(id_col) or f"row_{i}").strip()
+                payload = in_row.get(payload_col) or ""
+                w.writerow(parse_one(mid, payload, your_bics))
                 count += 1
 
     print(f"Wrote {count} rows to {args.out}")
